@@ -2,7 +2,7 @@ from celery import shared_task
 from django.core.mail import send_mail
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from .models import LeaveRequest, ApprovalStep
+from .models import LeaveRequest
 
 User = get_user_model()
 
@@ -13,6 +13,7 @@ def send_notification_email(leave_request_id, recipient_user_id, is_final_decisi
         recipient = User.objects.get(id=recipient_user_id)
         
         if is_final_decision:
+            # Notification to the employee about the final status
             subject = f"Update on your leave request: {leave_request.get_status_display()}"
             message = (
                 f"Hi {leave_request.employee.first_name},\n\n"
@@ -20,6 +21,7 @@ def send_notification_email(leave_request_id, recipient_user_id, is_final_decisi
                 f"Thank you."
             )
         else:
+            # Notification to an approver
             subject = f"Action Required: Leave Request for {leave_request.employee.get_full_name()}"
             message = (
                 f"Hi {recipient.first_name},\n\n"
@@ -39,6 +41,7 @@ def send_notification_email(leave_request_id, recipient_user_id, is_final_decisi
             fail_silently=False,
         )
     except (LeaveRequest.DoesNotExist, User.DoesNotExist) as e:
+        # Using a logger is better in production, but print is fine for this context.
         print(f"Could not send email for leave request {leave_request_id}: {e}")
     except Exception as e:
         print(f"An error occurred while sending email: {e}")
@@ -50,11 +53,13 @@ def create_calendar_event(leave_request_id, approver_user_id):
         leave_request = LeaveRequest.objects.select_related('employee').get(id=leave_request_id)
         approver = User.objects.get(id=approver_user_id)
 
+        # This is a mock implementation as requested.
+        # In a real scenario, this would integrate with an API like Google Calendar.
         print(f"--- MOCK CALENDAR EVENT CREATION ---")
         print(f"Creating calendar event for approver: {approver.email}")
         print(f"Leave Request: {leave_request.id}")
         print(f"Summary: Review leave for {leave_request.employee.get_full_name()}")
-        print(f"Start Time: {leave_request.created_at.isoformat()}")
+        print(f"Start Time: {leave_request.created_at.isoformat()}") # Or a more relevant time
         print(f"Description: Please review the leave request in the portal.")
         print(f"--- END MOCK ---")
         
