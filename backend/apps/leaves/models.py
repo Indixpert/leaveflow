@@ -24,11 +24,22 @@ class LeaveRequest(models.Model):
     leave_type = models.ForeignKey(LeaveType, on_delete=models.PROTECT)
     start_date = models.DateField()
     end_date = models.DateField()
+    total_days = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     reason = models.TextField(blank=True)
     document = models.FileField(upload_to='leave_documents/', blank=True, null=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def calculate_total_days(self):
+        if self.start_date and self.end_date:
+            # This is a simple calculation. A real system would exclude weekends/holidays.
+            return (self.end_date - self.start_date).days + 1
+        return 0
+
+    def save(self, *args, **kwargs):
+        self.total_days = self.calculate_total_days()
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.employee}'s {self.leave_type.name} request"
