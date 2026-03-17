@@ -1,117 +1,105 @@
-from rest_framework import viewsets, permissions, status
+from rest_framework import viewsets, mixins, status
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils import timezone
-from .models import LeaveRequest, ApprovalStep, LeaveType
-from .serializers import LeaveRequestSerializer, LeaveTypeSerializer
-
-class IsOwner(permissions.BasePermission):
-    """
-    Custom permission to only allow owners of an object to view or edit it.
-    """
-    def has_object_permission(self, request, view, obj):
-        return obj.employee == request.user
+from .models import LeaveRequest, LeaveType, ApprovalStep
+from .serializers import LeaveRequestSerializer, LeaveTypeSerializer, ApprovalStepSerializer
 
 class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    A viewset for viewing leave types.
+    API endpoint that allows leave types to be viewed.
     """
     queryset = LeaveType.objects.all()
     serializer_class = LeaveTypeSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
 class LeaveRequestViewSet(viewsets.ModelViewSet):
     """
-    A viewset for viewing and editing an employee's own leave requests.
+    API endpoint that allows leave requests to be viewed or edited.
     """
     serializer_class = LeaveRequestSerializer
-    permission_classes = [permissions.IsAuthenticated, IsOwner]
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         """
         This view should return a list of all the leave requests
         for the currently authenticated user.
         """
-        return LeaveRequest.objects.filter(employee=self.request.user).prefetch_related('approval_steps').order_by('-created_at')
+        return LeaveRequest.objects.filter(employee=self.request.user).order_by('-created_at')
 
     def perform_create(self, serializer):
-        serializer.save(employee=self.request.user)
+        # The serializer's create method already handles setting the employee
+        # and initial status.
+        serializer.save()
 
-    @action(detail=True, methods=['post'], url_path='submit')
-    def submit(self, request, pk=None):
-        leave_request = self.get_object()
-        if leave_request.status != LeaveRequest.Status.DRAFT:
-            return Response({'error': 'Only draft requests can be submitted.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        leave_request.status = LeaveRequest.Status.PENDING_MANAGER
-        leave_request.save()
-        return Response(self.get_serializer(leave_request).data)
-
-    @action(detail=True, methods=['post'], url_path='cancel')
+    @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
+        """
+        Action to cancel a leave request.
+        """
         leave_request = self.get_object()
-        if leave_request.status not in [LeaveRequest.Status.DRAFT, LeaveRequest.Status.PENDING_MANAGER, LeaveRequest.Status.PENDING_HR]:
-            return Response({'error': 'Cannot cancel a request that has already been approved or rejected.'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        leave_request.status = LeaveRequest.Status.CANCELLED
-        leave_request.save()
-        return Response(self.get_serializer(leave_request).data)
+        if leave_request.status in [LeaveRequest.Status.DRAFT, LeaveRequest.Status.PENDING_MANAGER]:
+            leave_request.status = LeaveRequest.Status.CANCELLED
+            leave_request.save(update_fields=['status'])
+            return Response(self.get_serializer(leave_request).data)
+        else:
+            return Response(
+                {'error': 'Cannot cancel a request that is already being processed by HR or is finalized.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-class ApprovalViewSet(viewsets.ViewSet):
+class ApprovalViewSet(mixins.ListModelMixin,
+                      mixins.RetrieveModelMixin,
+                      mixins.UpdateModelMixin,
+                      viewsets.GenericViewSet):
     """
-    A viewset for approvers to view and act on leave requests.
+    API endpoint for approvers to view and act on leave requests.
     """
-    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ApprovalStepSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return ApprovalStep.objects.filter(
-            approver=self.request.user,
-            decision=ApprovalStep.Decision.PENDING
-        ).select_related('request__employee', 'request__leave_type').order_by('request__created_at')
+        """
+        This view should return a list of all approval steps
+        for the currently authenticated user.
+        """
+        return ApprovalStep.objects.filter(approver=self.request.user).order_by('request__created_at')
 
-    def list(self, request):
-        queryset = self.get_queryset()
-        leave_requests = [step.request for step in queryset]
-        serializer = LeaveRequestSerializer(leave_requests, many=True, context={'request': request})
-        return Response(serializer.data)
-
-    def make_decision(self, request, request_id, decision):
-        try:
-            approval_step = ApprovalStep.objects.get(
-                request_id=request_id,
-                approver=request.user,
-                decision=ApprovalStep.Decision.PENDING
-            )
-        except ApprovalStep.DoesNotExist:
-            return Response({'error': 'No pending approval found for you for this request.'}, status=status.HTTP_404_NOT_FOUND)
-
-        leave_request = approval_step.request
+    def update(self, request, *args, **kwargs):
+        """
+        Handle an approver's decision.
+        """
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
         
-        approval_step.decision = decision
-        approval_step.comment = request.data.get('comment', '')
-        approval_step.decided_at = timezone.now()
-        approval_step.save()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        
+        decision = serializer.validated_data.get('decision')
+        
+        if instance.decision != ApprovalStep.Decision.PENDING:
+            return Response({'error': 'This request has already been decided upon.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        if decision not in [ApprovalStep.Decision.APPROVED, ApprovalStep.Decision.REJECTED]:
+            return Response({'error': 'Invalid decision.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        instance.decision = decision
+        instance.comment = serializer.validated_data.get('comment', '')
+        instance.decided_at = timezone.now()
+        instance.save()
+        
+        leave_request = instance.request
         if decision == ApprovalStep.Decision.REJECTED:
             leave_request.status = LeaveRequest.Status.REJECTED
-        elif approval_step.role == ApprovalStep.Role.MANAGER:
-            hr_step_exists = leave_request.approval_steps.filter(role=ApprovalStep.Role.HR).exists()
-            if hr_step_exists and leave_request.approval_steps.filter(role=ApprovalStep.Role.HR, decision=ApprovalStep.Decision.PENDING).exists():
+        elif instance.role == ApprovalStep.Role.MANAGER:
+            if ApprovalStep.objects.filter(request=leave_request, role=ApprovalStep.Role.HR).exists():
                 leave_request.status = LeaveRequest.Status.PENDING_HR
             else:
                 leave_request.status = LeaveRequest.Status.APPROVED
-        elif approval_step.role == ApprovalStep.Role.HR:
+        elif instance.role == ApprovalStep.Role.HR:
             leave_request.status = LeaveRequest.Status.APPROVED
-        
-        leave_request.save()
+            
+        leave_request.save(update_fields=['status'])
 
-        serializer = LeaveRequestSerializer(leave_request, context={'request': request})
-        return Response(serializer.data)
-
-    @action(detail=False, methods=['post'], url_path='(?P<request_id>[^/.]+)/approve')
-    def approve(self, request, request_id=None):
-        return self.make_decision(request, request_id, ApprovalStep.Decision.APPROVED)
-
-    @action(detail=False, methods=['post'], url_path='(?P<request_id>[^/.]+)/reject')
-    def reject(self, request, request_id=None):
-        return self.make_decision(request, request_id, ApprovalStep.Decision.REJECTED)
+        return Response(LeaveRequestSerializer(leave_request).data)
