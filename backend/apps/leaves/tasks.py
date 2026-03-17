@@ -1,15 +1,20 @@
 from celery import shared_task
 from django.core.mail import send_mail
 from django.conf import settings
-# from .utils import create_google_calendar_event # Assuming a utility function exists
+from django.utils import timezone
+from django.db import transaction
+from django.contrib.auth import get_user_model
+from decimal import Decimal
+
+from .models import LeaveRequest, ApprovalStep, LeavePolicy, LeaveBalance, BalanceAuditLog
+
+User = get_user_model()
 
 @shared_task
 def process_leave_request_change(leave_request_id):
     """
     Handles notifications and other side effects of a leave request status change.
     """
-    from .models import LeaveRequest, ApprovalStep
-    
     try:
         request = LeaveRequest.objects.get(id=leave_request_id)
     except LeaveRequest.DoesNotExist:
@@ -42,3 +47,85 @@ def process_leave_request_change(leave_request_id):
             pass
             
     return f"Processed leave request {leave_request_id} with status {request.status}"
+
+
+@shared_task
+def accrue_monthly_leave():
+    """
+    Scheduled task to accrue leave for all active employees.
+    Runs on the 1st of each month.
+    Handles year-end carry-forward in January.
+    """
+    today = timezone.now().date()
+    current_year = today.year
+    is_january = today.month == 1
+
+    active_employees = User.objects.filter(is_active=True)
+    
+    for employee in active_employees:
+        # Assuming employee has 'employment_type' attribute from the custom User model
+        if not hasattr(employee, 'employment_type'):
+            continue
+
+        policies = LeavePolicy.objects.filter(employment_type=employee.employment_type)
+        
+        for policy in policies:
+            with transaction.atomic():
+                # Year-end rollover logic
+                if is_january:
+                    previous_year = current_year - 1
+                    try:
+                        prev_balance_obj = LeaveBalance.objects.get(
+                            employee=employee,
+                            leave_type=policy.leave_type,
+                            year=previous_year
+                        )
+                        
+                        carry_forward_amount = min(prev_balance_obj.balance, policy.carry_forward_max)
+                        
+                        if carry_forward_amount > 0:
+                            # Get or create new balance for current year with carry-forward amount
+                            new_balance_obj, created = LeaveBalance.objects.get_or_create(
+                                employee=employee,
+                                leave_type=policy.leave_type,
+                                year=current_year,
+                                defaults={'balance': carry_forward_amount}
+                            )
+                            if not created:
+                                new_balance_obj.balance += carry_forward_amount
+                                new_balance_obj.save(update_fields=['balance'])
+
+                            BalanceAuditLog.objects.create(
+                                balance_entry=new_balance_obj,
+                                change=carry_forward_amount,
+                                reason=BalanceAuditLog.Reason.CARRY_FORWARD
+                            )
+                    except LeaveBalance.DoesNotExist:
+                        # No balance in the previous year, nothing to carry forward.
+                        pass
+
+                # Monthly accrual logic
+                balance_obj, created = LeaveBalance.objects.get_or_create(
+                    employee=employee,
+                    leave_type=policy.leave_type,
+                    year=current_year
+                )
+                
+                current_balance = balance_obj.balance
+                accrual_amount = policy.days_per_month
+                
+                # Cap the balance at max_balance
+                new_balance = min(current_balance + accrual_amount, policy.max_balance)
+                actual_accrual = new_balance - current_balance
+                
+                if actual_accrual > Decimal('0.00'):
+                    balance_obj.balance = new_balance
+                    balance_obj.save(update_fields=['balance'])
+                    
+                    BalanceAuditLog.objects.create(
+                        balance_entry=balance_obj,
+                        change=actual_accrual,
+                        reason=BalanceAuditLog.Reason.ACCRUAL
+                    )
+                    
+    return f"Leave accrual process completed for {today}."
