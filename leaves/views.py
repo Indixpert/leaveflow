@@ -8,6 +8,8 @@ import numpy as np
 from .models import LeaveRequest, LeaveType, ApprovalStep, PublicHoliday
 from .serializers import LeaveRequestSerializer, LeaveTypeSerializer, ApprovalStepSerializer
 
+print('print for testing')
+
 class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
     """
     API endpoint that allows leave types to be viewed.
